@@ -1,5 +1,6 @@
 /*
  * Copyright (C) AlexWoo(Wu Jie) wj19840501@gmail.com
+ * fixed by Ping cczjp89@gmail.com
  */
 
 
@@ -240,6 +241,11 @@ ngx_client_connect_server(void *data, struct sockaddr *sa, socklen_t socklen)
 
     s = data;
 
+    if (!sa) {
+        ngx_log_error(NGX_LOG_ERR, &s->ci->log, ngx_errno,
+                "client: connect_server| nginx client sockaddr invalid");
+        return;
+    }
     ngx_inet_set_port(sa, s->ci->port);
 
     s->peer.sockaddr = sa;
@@ -515,7 +521,7 @@ ngx_client_init(ngx_str_t *peer, ngx_str_t *local, ngx_flag_t udp,
 
     ci->postpone_output = 1460;
 
-    ci->dynamic_resolver = 1;
+    ci->dynamic_resolver = 0;
 
     ci->log_error = NGX_LOG_ERR;
 
