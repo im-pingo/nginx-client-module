@@ -521,7 +521,7 @@ ngx_client_init(ngx_str_t *peer, ngx_str_t *local, ngx_flag_t udp,
 
     ci->postpone_output = 1460;
 
-    ci->dynamic_resolver = 0;
+    ci->dynamic_resolver = 1;
 
     ci->log_error = NGX_LOG_ERR;
 
