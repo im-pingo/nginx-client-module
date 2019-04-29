@@ -5,11 +5,15 @@
 
 #include "ngx_http_client.h"
 #include "ngx_rbuf.h"
+#include "ngx_poold.h"
+#include "ngx_map.h"
+#include "ngx_timerd.h"
 
 
 static void *ngx_http_client_module_create_conf(ngx_cycle_t *cycle);
-static char *ngx_http_client_init_conf(ngx_cycle_t *cycle, void *conf);
+static char *ngx_http_client_module_init_conf(ngx_cycle_t *cycle, void *conf);
 
+/* headers in */
 static ngx_int_t ngx_http_client_process_header_line(ngx_http_request_t *r,
        ngx_table_elt_t *h, ngx_uint_t offset);
 static ngx_int_t ngx_http_client_process_content_length(ngx_http_request_t *r,
@@ -20,22 +24,97 @@ static ngx_int_t
        ngx_http_client_process_transfer_encoding(ngx_http_request_t *r,
        ngx_table_elt_t *h, ngx_uint_t offset);
 
-static size_t ngx_http_client_host_len(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset);
-static void   ngx_http_client_host_set(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset, ngx_buf_t *b);
-static size_t ngx_http_client_user_agent_len(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset);
-static void   ngx_http_client_user_agent_set(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset, ngx_buf_t *b);
-static size_t ngx_http_client_connection_len(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset);
-static void   ngx_http_client_connection_set(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset, ngx_buf_t *b);
-static size_t ngx_http_client_accept_len(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset);
-static void   ngx_http_client_accept_set(ngx_http_request_t *r,
-       ngx_str_t *name, ngx_uint_t offset, ngx_buf_t *b);
+/* headers out */
+static void ngx_http_client_host(ngx_http_request_t *r, ngx_str_t *value);
+static void ngx_http_client_user_agent(ngx_http_request_t *r,
+       ngx_str_t *value);
+static void ngx_http_client_connection(ngx_http_request_t *r, ngx_str_t *value);
+static void ngx_http_client_accept(ngx_http_request_t *r, ngx_str_t *value);
+static void ngx_http_client_date(ngx_http_request_t *r, ngx_str_t *value);
+
+
+/* for http response */
+typedef struct {
+    ngx_list_t                      headers;
+
+    ngx_uint_t                      http_version;
+    ngx_uint_t                      status_n;
+    ngx_str_t                       status_line;
+
+    ngx_table_elt_t                *status;
+    ngx_table_elt_t                *date;
+    ngx_table_elt_t                *server;
+    ngx_table_elt_t                *connection;
+
+    ngx_table_elt_t                *expires;
+    ngx_table_elt_t                *etag;
+    ngx_table_elt_t                *x_accel_expires;
+    ngx_table_elt_t                *x_accel_redirect;
+    ngx_table_elt_t                *x_accel_limit_rate;
+
+    ngx_table_elt_t                *content_type;
+    ngx_table_elt_t                *content_length;
+
+    ngx_table_elt_t                *last_modified;
+    ngx_table_elt_t                *location;
+    ngx_table_elt_t                *accept_ranges;
+    ngx_table_elt_t                *www_authenticate;
+    ngx_table_elt_t                *transfer_encoding;
+
+#if (NGX_HTTP_GZIP)
+    ngx_table_elt_t                *content_encoding;
+#endif
+
+    off_t                           content_length_n;
+
+    unsigned                        connection_type:2;
+    unsigned                        chunked:1;
+} ngx_http_client_headers_in_t;
+
+
+typedef struct {
+    ngx_map_node_t                  node;
+    ngx_str_t                       key;
+    ngx_str_t                       value;
+} ngx_http_client_header_out_t;
+
+
+typedef struct {
+    ngx_array_t                     headers; /* ngx_http_client_header_out_t */
+    ngx_map_t                       hash;    /* find header by header */
+} ngx_http_client_headers_out_t;
+
+
+typedef struct {
+    ngx_client_session_t           *session;
+    void                           *request;
+
+    /* Request */
+    ngx_request_url_t               url;
+
+    /* Response */
+    ngx_http_status_t               status;
+    ngx_http_chunked_t              chunked;
+    ngx_int_t                       length;
+
+    /* bufs */
+    ngx_chain_t                    *in;
+    ngx_buf_t                      *buffer;     /* status line buf */
+
+    /* config */
+    ngx_msec_t                      header_timeout;
+    size_t                          header_buffer_size;
+
+    /* runtime */
+    off_t                           rbytes;     /* read bytes */
+    off_t                           wbytes;     /* write bytes */
+
+    ngx_http_client_headers_in_t    headers_in;
+    ngx_http_client_headers_out_t   headers_out;
+
+    ngx_http_client_handler_pt      read_handler;
+    ngx_http_client_handler_pt      write_handler;
+} ngx_http_client_ctx_t;
 
 
 static ngx_str_t ngx_http_client_method[] = {
@@ -56,6 +135,7 @@ static ngx_str_t ngx_http_client_method[] = {
     ngx_string("TRACE")
 };
 
+
 static ngx_str_t ngx_http_client_version[] = {
     ngx_string("HTTP/0.9"), /* not support, will not use */
     ngx_string("HTTP/1.0"),
@@ -63,26 +143,28 @@ static ngx_str_t ngx_http_client_version[] = {
     ngx_string("HTTP/2.0")
 };
 
+
 #define NGX_HTTP_CLIENT_CONNECTION_CLOSE        1
 #define NGX_HTTP_CLIENT_CONNECTION_KEEP_ALIVE   2
 #define NGX_HTTP_CLIENT_CONNECTION_UPGRADE      3
 
 
-typedef size_t (* ngx_http_client_header_len_pt)(ngx_http_request_t *r,
-        ngx_str_t *name, ngx_uint_t offset);
-typedef void   (* ngx_http_client_header_set_pt)(ngx_http_request_t *r,
-        ngx_str_t *name, ngx_uint_t offset, ngx_buf_t *b);
+typedef void (*ngx_http_client_fill_header_pt)(ngx_http_request_t *r,
+                                               ngx_str_t *value);
 
 typedef struct {
     ngx_str_t                       name;
-    ngx_uint_t                      offset;
-    ngx_http_client_header_len_pt   header_len;
-    ngx_http_client_header_set_pt   header_set;
+    ngx_http_client_fill_header_pt  handler;
 } ngx_http_client_fill_header_t;
 
 
 typedef struct {
     ngx_hash_t                      headers_in_hash;
+
+    /* wait for response header timeout */
+    ngx_msec_t                      header_timeout;
+    size_t                          header_buffer_size;
+    size_t                          body_buffer_size;
 } ngx_http_client_conf_t;
 
 
@@ -155,28 +237,39 @@ ngx_http_header_t  ngx_http_client_headers_in[] = {
     { ngx_null_string, 0, NULL }
 };
 
-ngx_http_client_fill_header_t ngx_http_client_fill_header[] = {
 
-    { ngx_string("Host"), offsetof(ngx_http_client_headers_set_t, set_host),
-      ngx_http_client_host_len, ngx_http_client_host_set },
-
-    { ngx_string("User-Agent"),
-      offsetof(ngx_http_client_headers_set_t, set_user_agent),
-      ngx_http_client_user_agent_len, ngx_http_client_user_agent_set },
-
-    { ngx_string("Connection"),
-      offsetof(ngx_http_client_headers_set_t, set_connection),
-      ngx_http_client_connection_len, ngx_http_client_connection_set },
-
-    { ngx_string("Accept"),
-      offsetof(ngx_http_client_headers_set_t, set_accept),
-      ngx_http_client_accept_len, ngx_http_client_accept_set },
-
-    { ngx_null_string, 0, NULL, NULL }
+ngx_http_client_fill_header_t ngx_http_client_default_header[] = {
+    { ngx_string("Host"),       ngx_http_client_host       },
+    { ngx_string("User-Agent"), ngx_http_client_user_agent },
+    { ngx_string("Connection"), ngx_http_client_connection },
+    { ngx_string("Accept"),     ngx_http_client_accept     },
+    { ngx_string("Date"),       ngx_http_client_date       },
+    { ngx_null_string,          NULL }
 };
 
 
 static ngx_command_t    ngx_http_client_commands[] = {
+
+    { ngx_string("header_timeout"),
+      NGX_MAIN_CONF|NGX_DIRECT_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      0,
+      offsetof(ngx_http_client_conf_t, header_timeout),
+      NULL },
+
+    { ngx_string("header_buffer_size"),
+      NGX_MAIN_CONF|NGX_DIRECT_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      0,
+      offsetof(ngx_http_client_conf_t, header_buffer_size),
+      NULL },
+
+    { ngx_string("body_buffer_size"),
+      NGX_MAIN_CONF|NGX_DIRECT_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      0,
+      offsetof(ngx_http_client_conf_t, body_buffer_size),
+      NULL },
 
       ngx_null_command
 };
@@ -185,7 +278,7 @@ static ngx_command_t    ngx_http_client_commands[] = {
 static ngx_core_module_t    ngx_http_client_module_ctx = {
     ngx_string("http_client"),
     ngx_http_client_module_create_conf,
-    ngx_http_client_init_conf
+    ngx_http_client_module_init_conf
 };
 
 
@@ -215,13 +308,18 @@ ngx_http_client_module_create_conf(ngx_cycle_t *cycle)
         return NULL;
     }
 
+    hccf->header_timeout = NGX_CONF_UNSET_MSEC;
+    hccf->header_buffer_size = NGX_CONF_UNSET_SIZE;
+    hccf->body_buffer_size = NGX_CONF_UNSET_SIZE;
+
     return hccf;
 }
 
+
 static char *
-ngx_http_client_init_conf(ngx_cycle_t *cycle, void *conf)
+ngx_http_client_module_init_conf(ngx_cycle_t *cycle, void *conf)
 {
-    ngx_http_upstream_main_conf_t  *hccf = conf;
+    ngx_http_client_conf_t         *hccf = conf;
 
     ngx_array_t                     headers_in;
     ngx_hash_key_t                 *hk;
@@ -259,6 +357,10 @@ ngx_http_client_init_conf(ngx_cycle_t *cycle, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    ngx_conf_init_msec_value(hccf->header_timeout, 10000);
+    ngx_conf_init_size_value(hccf->header_buffer_size, ngx_pagesize);
+    ngx_conf_init_size_value(hccf->body_buffer_size, ngx_pagesize);
+
     return NGX_CONF_OK;
 }
 
@@ -281,6 +383,7 @@ ngx_http_client_process_header_line(ngx_http_request_t *r, ngx_table_elt_t *h,
     return NGX_OK;
 }
 
+
 static ngx_int_t
 ngx_http_client_process_content_length(ngx_http_request_t *r,
        ngx_table_elt_t *h, ngx_uint_t offset)
@@ -300,6 +403,7 @@ ngx_http_client_process_content_length(ngx_http_request_t *r,
 
     return NGX_OK;
 }
+
 
 static ngx_int_t
 ngx_http_client_process_connection(ngx_http_request_t *r, ngx_table_elt_t *h,
@@ -322,6 +426,7 @@ ngx_http_client_process_connection(ngx_http_request_t *r, ngx_table_elt_t *h,
     return NGX_OK;
 }
 
+
 static ngx_int_t
 ngx_http_client_process_transfer_encoding(ngx_http_request_t *r,
        ngx_table_elt_t *h, ngx_uint_t offset)
@@ -342,190 +447,54 @@ ngx_http_client_process_transfer_encoding(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-static size_t
-ngx_http_client_host_len(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset)
-{
-    ngx_http_client_ctx_t      *ctx;
-    size_t                      len;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return 0;
-    }
-
-    len = name->len + sizeof(": ") - 1 + ctx->url.host_with_port.len
-        + sizeof(CRLF) - 1;
-
-    return len;
-}
 
 static void
-ngx_http_client_host_set(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset, ngx_buf_t *b)
+ngx_http_client_host(ngx_http_request_t *r, ngx_str_t *value)
 {
     ngx_http_client_ctx_t      *ctx;
-    unsigned                   *flag;
 
     ctx = r->ctx[0];
 
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return;
-    }
-
-    b->last = ngx_cpymem(b->last, name->data, name->len);
-    *b->last++ = ':'; *b->last++ = ' ';
-    b->last = ngx_cpymem(b->last, ctx->url.host_with_port.data,
-                         ctx->url.host_with_port.len);
-    *b->last++ = CR; *b->last++ = LF;
+    value->data = ctx->url.host.data;
+    value->len = ctx->url.host.len;
 }
 
-static size_t
-ngx_http_client_user_agent_len(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset)
-{
-    ngx_http_client_ctx_t      *ctx;
-    size_t                      len;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return 0;
-    }
-
-    len = name->len + sizeof(": ") - 1 + ngx_strlen(NGINX_VER)
-        + sizeof(CRLF) - 1;
-
-    return len;
-}
 
 static void
-ngx_http_client_user_agent_set(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset, ngx_buf_t *b)
+ngx_http_client_user_agent(ngx_http_request_t *r, ngx_str_t *value)
 {
-    ngx_http_client_ctx_t      *ctx;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return;
-    }
-
-    b->last = ngx_cpymem(b->last, name->data, name->len);
-    *b->last++ = ':'; *b->last++ = ' ';
-    b->last = ngx_cpymem(b->last, NGINX_VER, ngx_strlen(NGINX_VER));
-    *b->last++ = CR; *b->last++ = LF;
+    value->data = (u_char *) NGINX_VER;
+    value->len = sizeof(NGINX_VER) - 1;
 }
 
-static size_t
-ngx_http_client_connection_len(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset)
+
+static void
+ngx_http_client_connection(ngx_http_request_t *r, ngx_str_t *value)
 {
-    ngx_http_client_ctx_t      *ctx;
-    size_t                      len;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return 0;
-    }
-
-    len = name->len + sizeof(": ") - 1;
-
-    if (r->http_version >= NGX_HTTP_CLIENT_VERSION_11) {
-        len += sizeof("keep-alive") - 1;
+    if (r->http_version < NGX_HTTP_CLIENT_VERSION_11) {
+        value->data = (u_char *) "close";
+        value->len = sizeof("close") - 1;
     } else {
-        len += sizeof("close") - 1;
+        value->len = 0;
     }
-
-    len += sizeof(CRLF) - 1;
-
-    return len;
 }
+
 
 static void
-ngx_http_client_connection_set(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset, ngx_buf_t *b)
+ngx_http_client_accept(ngx_http_request_t *r, ngx_str_t *value)
 {
-    ngx_http_client_ctx_t      *ctx;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return;
-    }
-
-    b->last = ngx_cpymem(b->last, name->data, name->len);
-    *b->last++ = ':'; *b->last++ = ' ';
-
-    if (r->http_version >= NGX_HTTP_CLIENT_VERSION_11) {
-        b->last = ngx_cpymem(b->last, "keep-alive", sizeof("keep-alive") - 1);
-    } else {
-        b->last = ngx_cpymem(b->last, "close", sizeof("close") - 1);
-    }
-
-    *b->last++ = CR; *b->last++ = LF;
+    value->data = (u_char *) "*/*";
+    value->len = sizeof("*/*") - 1;
 }
 
-static size_t
-ngx_http_client_accept_len(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset)
-{
-    ngx_http_client_ctx_t      *ctx;
-    size_t                      len;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return 0;
-    }
-
-    len = name->len + sizeof(": ") - 1 + sizeof("*/*") - 1 + sizeof(CRLF) - 1;
-
-    return len;
-}
 
 static void
-ngx_http_client_accept_set(ngx_http_request_t *r, ngx_str_t *name,
-        ngx_uint_t offset, ngx_buf_t *b)
+ngx_http_client_date(ngx_http_request_t *r, ngx_str_t *value)
 {
-    ngx_http_client_ctx_t      *ctx;
-    unsigned                   *flag;
-
-    ctx = r->ctx[0];
-
-    flag = (unsigned *) ((char *) &ctx->headers_set + offset);
-
-    if (*flag) { /* header has been set */
-        return;
-    }
-
-    b->last = ngx_cpymem(b->last, name->data, name->len);
-    *b->last++ = ':'; *b->last++ = ' ';
-    b->last = ngx_cpymem(b->last, "*/*", sizeof("*/*") - 1);
-    *b->last++ = CR; *b->last++ = LF;
+    value->data = ngx_cached_http_time.data;
+    value->len = ngx_cached_http_time.len;
 }
+
 
 static void
 ngx_http_client_free_request(ngx_http_request_t *hcr)
@@ -541,29 +510,38 @@ ngx_http_client_free_request(ngx_http_request_t *hcr)
 
     ctx = hcr->ctx[0];
     s = ctx->session;
-    cln = hcr->cleanup;
-    hcr->cleanup = NULL;
 
-    while (cln) {
-        if (cln->handler) {
-            cln->handler(cln->data);
+    if (ctx->request) {
+        cln = hcr->cleanup;
+        hcr->cleanup = NULL;
+
+        while (cln) {
+            if (cln->handler) {
+                cln->handler(cln->data);
+            }
+
+            cln = cln->next;
         }
+    }
 
-        cln = cln->next;
+    if (ctx->in) {
+        ngx_put_chainbufs(ctx->in);
+        ctx->in = NULL;
     }
 
     if (s) {
-        s->ci->recv = NULL;
-        s->ci->send = NULL;
-        s->ci->closed = NULL;
+        s->client_recv = NULL;
+        s->client_send = NULL;
+        s->client_closed = NULL;
         s->out = NULL;
     }
 
     pool = hcr->pool;
     hcr->pool = NULL;
 
-    ngx_destroy_pool(pool);
+    NGX_DESTROY_POOL(pool);
 }
+
 
 static void
 ngx_http_client_close_handler(ngx_client_session_t *s)
@@ -573,8 +551,39 @@ ngx_http_client_close_handler(ngx_client_session_t *s)
     r = s->data;
 
     ngx_http_client_free_request(r);
-    ngx_client_close(s);
 }
+
+
+static void
+ngx_http_client_discarded_body(ngx_http_request_t *r)
+{
+    ngx_http_client_ctx_t      *ctx;
+    ngx_chain_t                *cl;
+    ngx_int_t                   rc;
+
+    ctx = r->ctx[0];
+
+    rc = ngx_http_client_read_body(r, &cl);
+
+    if (rc == 0 || rc == NGX_ERROR) { // http client close
+        ngx_http_client_finalize_request(r, 1);
+        return;
+    }
+
+    // if detach, all http response receive, set keepalive
+    if (rc == NGX_DONE) {
+        ngx_http_client_finalize_request(r, 0);
+        return;
+    }
+
+    // NGX_AGAIN
+
+    if (ctx->in) { // make rbuf recycle immediately
+        ngx_put_chainbufs(ctx->in);
+        ctx->in = NULL;
+    }
+}
+
 
 static void
 ngx_http_client_read_handler(ngx_client_session_t *s)
@@ -588,8 +597,13 @@ ngx_http_client_read_handler(ngx_client_session_t *s)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "http client, read handler");
 
-    ctx->read_handler(ctx->request, r);
+    if (ctx->request && ctx->read_handler) {
+        ctx->read_handler(ctx->request, r);
+    } else {
+        ngx_http_client_discarded_body(r);
+    }
 }
+
 
 static void
 ngx_http_client_process_header(ngx_client_session_t *s)
@@ -597,7 +611,6 @@ ngx_http_client_process_header(ngx_client_session_t *s)
     ngx_http_request_t         *r;
     ngx_http_client_ctx_t      *ctx;
     ngx_buf_t                  *b;
-    ngx_connection_t           *c;
     ngx_int_t                   n, rc;
     ngx_table_elt_t            *h;
     ngx_http_header_t          *hh;
@@ -608,11 +621,10 @@ ngx_http_client_process_header(ngx_client_session_t *s)
                                                    ngx_http_client_module);
 
     r = s->data;
-    c = r->connection;
     ctx = r->ctx[0];
     rev = r->connection->read;
 
-    b = c->buffer;
+    b = ctx->buffer;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "http client, process header");
@@ -714,6 +726,8 @@ ngx_http_client_process_header(ngx_client_session_t *s)
                 ctx->headers_in.content_length_n = -1;
             }
 
+            ctx->length = ctx->headers_in.content_length_n;
+
             break;
         }
 
@@ -729,7 +743,8 @@ ngx_http_client_process_header(ngx_client_session_t *s)
 
             if (n == NGX_AGAIN) {
                 if (!rev->timer_set) {
-                    ngx_add_timer(rev, ctx->server_header_timeout);
+                    NGX_ADD_TIMER(rev, ctx->header_timeout,
+                                  offsetof(ngx_connection_t, number));
                 }
 
                 if (ngx_handle_read_event(rev, 0) != NGX_OK) {
@@ -741,6 +756,7 @@ ngx_http_client_process_header(ngx_client_session_t *s)
             }
 
             /* NGX_OK */
+            ctx->rbytes += n;
 
             continue;
         }
@@ -752,10 +768,10 @@ ngx_http_client_process_header(ngx_client_session_t *s)
         goto error;
     }
 
-    s->ci->recv = ngx_http_client_read_handler;
+    s->client_recv = ngx_http_client_read_handler;
 
     if (rev->timer_set) {
-        ngx_del_timer(rev);
+        NGX_DEL_TIMER(rev, r->connection->number);
     }
 
     return ngx_http_client_read_handler(s);
@@ -764,22 +780,21 @@ error:
     ngx_http_client_finalize_request(r, 1);
 }
 
+
 static void
 ngx_http_client_process_status_line(ngx_client_session_t *s)
 {
     ngx_http_request_t         *r;
     ngx_http_client_ctx_t      *ctx;
     ngx_buf_t                  *b;
-    ngx_connection_t           *c;
     ngx_int_t                   n, rc;
     ngx_event_t                *rev;
 
     r = s->data;
-    c = r->connection;
     ctx = r->ctx[0];
     rev = r->connection->read;
 
-    b = c->buffer;
+    b = ctx->buffer;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "http client, process status line");
@@ -799,7 +814,8 @@ ngx_http_client_process_status_line(ngx_client_session_t *s)
 
             if (n == NGX_AGAIN) {
                 if (!rev->timer_set) {
-                    ngx_add_timer(rev, ctx->server_header_timeout);
+                    NGX_ADD_TIMER(rev, ctx->header_timeout,
+                                  offsetof(ngx_connection_t, number));
                 }
 
                 if (ngx_handle_read_event(rev, 0) != NGX_OK) {
@@ -811,6 +827,7 @@ ngx_http_client_process_status_line(ngx_client_session_t *s)
             }
 
             /* NGX_OK */
+            ctx->rbytes += n;
 
             continue;
         }
@@ -840,9 +857,10 @@ ngx_http_client_process_status_line(ngx_client_session_t *s)
     ngx_memcpy(ctx->headers_in.status_line.data, ctx->status.start,
                ctx->headers_in.status_line.len);
 
-    s->ci->recv = ngx_http_client_process_header;
+    s->client_recv = ngx_http_client_process_header;
     return ngx_http_client_process_header(s);
 }
+
 
 static void
 ngx_http_client_wait_response_handler(ngx_client_session_t *s)
@@ -858,10 +876,10 @@ ngx_http_client_wait_response_handler(ngx_client_session_t *s)
     r = s->data;
     c = r->connection;
     ctx = r->ctx[0];
-    size = ctx->server_header_buffer_size;
+    size = ctx->header_buffer_size;
     rev = s->connection->read;
 
-    b = c->buffer;
+    b = ctx->buffer;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "http client, process response handler");
@@ -873,7 +891,7 @@ ngx_http_client_wait_response_handler(ngx_client_session_t *s)
             return;
         }
 
-        c->buffer = b;
+        ctx->buffer = b;
     } else if (b->start == NULL) {
 
         b->start = ngx_pcalloc(c->pool, size);
@@ -902,7 +920,8 @@ ngx_http_client_wait_response_handler(ngx_client_session_t *s)
 
     if (n == NGX_AGAIN) {
         if (!rev->timer_set) {
-            ngx_add_timer(rev, ctx->server_header_timeout);
+            NGX_ADD_TIMER(rev, ctx->header_timeout,
+                          offsetof(ngx_connection_t, number));
         }
 
         if (ngx_handle_read_event(rev, 0) != NGX_OK) {
@@ -913,109 +932,101 @@ ngx_http_client_wait_response_handler(ngx_client_session_t *s)
         return;
     }
 
-    s->ci->recv = ngx_http_client_process_status_line;
+    ctx->rbytes += n;
+
+    s->client_recv = ngx_http_client_process_status_line;
     return ngx_http_client_process_status_line(s);
 }
 
+
 static ngx_int_t
-ngx_http_client_reinit(ngx_client_session_t *s)
+ngx_http_client_set_url(ngx_http_request_t *r, ngx_str_t *url, ngx_log_t *log)
 {
-    ngx_http_request_t         *r;
-    ngx_connection_t           *c;
     ngx_http_client_ctx_t      *ctx;
+    ngx_client_session_t       *cs;
+    ngx_int_t                   rc;
 
-    r = s->data;
-    r->connection = s->peer.connection;
-    c = s->peer.connection;
-
-    /* after connect, reinit parse status for status line and chunked */
     ctx = r->ctx[0];
-    ctx->status.code = 0;
-    ctx->status.count = 0;
-    ctx->status.start = NULL;
-    ctx->status.end = NULL;
-    ctx->chunked.state = 0;
-    ctx->length = 0;
-    ctx->chain = NULL;
 
-    s->ci->recv = ngx_http_client_wait_response_handler;
+    if (ctx->session) {
+        ngx_log_error(NGX_LOG_INFO, log, 0, "http client, url has been set");
+        return NGX_OK;
+    }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "http client, reinit");
-
-    /*
-     * init ctx->headers_in, headers_in use c->pool,
-     * reconnect will destroy and reinit ctx->headsers_in
-     */
-    ngx_memzero(&ctx->headers_in, sizeof(ngx_http_client_headers_in_t));
-    if (ngx_list_init(&ctx->headers_in.headers, c->pool, 20,
-                      sizeof(ngx_table_elt_t))
-        != NGX_OK)
-    {
+    r->request_line.data = ngx_pcalloc(r->pool, url->len);
+    if (r->request_line.data == NULL) {
         return NGX_ERROR;
     }
-    ctx->headers_in.content_length_n = -1;
+    ngx_memcpy(r->request_line.data, url->data, url->len);
+    r->request_line.len = url->len;
 
-    /*
-     * init ctx->header_set
-     */
-    ngx_memzero(&ctx->headers_set, sizeof(ngx_http_client_headers_set_t));
+    rc = ngx_parse_request_url(&ctx->url, &r->request_line);
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    /* create session */
+    cs = ngx_client_create(&ctx->url.host, NULL, 0, log);
+    if (cs == NULL) {
+        return NGX_ERROR;
+    }
+
+    cs->port = ngx_request_port(&ctx->url.scheme, &ctx->url.port);
+
+    ctx->session = cs;
+    cs->data = r;
 
     return NGX_OK;
 }
 
-static void
-ngx_http_client_set_header_flag(ngx_http_request_t *r, ngx_str_t *name)
+
+static ngx_int_t
+ngx_http_client_add_header(ngx_http_request_t *r, ngx_str_t *header,
+        ngx_str_t *value)
 {
-    ngx_http_client_fill_header_t  *h;
-    ngx_http_client_ctx_t          *ctx;
-    unsigned                       *flag;
+    ngx_http_client_ctx_t      *ctx;
+    ngx_http_client_header_out_t *h;
+    ngx_map_node_t             *node;
 
     ctx = r->ctx[0];
 
-    h = ngx_http_client_fill_header;
-    while (h->name.len) {
-        if (name->len == h->name.len
-            && ngx_memcmp(name->data, h->name.data, name->len) == 0)
-        {
-            flag = (unsigned *) ((char *) &ctx->headers_set + h->offset);
-            *flag = 1;
-
-            return;
+    node = ngx_map_find(&ctx->headers_out.hash, (intptr_t) header);
+    if (node) { // header exist
+        h = (ngx_http_client_header_out_t *) node;
+    } else { // header not exist
+        h = ngx_array_push(&ctx->headers_out.headers);
+        if (h == NULL) {
+            return NGX_ERROR;
         }
+        ngx_memzero(h, sizeof(ngx_http_client_header_out_t));
 
-        ++h;
-    }
-}
+        h->key.data = ngx_pcalloc(r->pool, header->len);
+        if (h->key.data == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(h->key.data, header->data, header->len);
+        h->key.len = header->len;
 
-static size_t
-ngx_http_client_default_header_len(ngx_http_request_t *r)
-{
-    ngx_http_client_fill_header_t  *h;
-    size_t                          len;
-
-    len = 0;
-
-    h = ngx_http_client_fill_header;
-    while (h->name.len) {
-        len += h->header_len(r, &h->name, h->offset);
-        ++h;
+        h->node.raw_key = (intptr_t) &h->key;
+        ngx_map_insert(&ctx->headers_out.hash, &h->node, 1);
     }
 
-    return len;
-}
-
-static void
-ngx_http_client_default_header_set(ngx_http_request_t *r, ngx_buf_t *b)
-{
-    ngx_http_client_fill_header_t  *h;
-
-    h = ngx_http_client_fill_header;
-    while (h->name.len) {
-        h->header_set(r, &h->name, h->offset, b);
-        ++h;
+    if (value->len == 0) { // delete header
+        h->value.len = 0;
+        return NGX_OK;
     }
+
+    // add or modify header
+    h->value.data = ngx_pcalloc(r->pool, value->len);
+    if (h->value.data == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(h->value.data, value->data, value->len);
+    h->value.len = value->len;
+
+    return NGX_OK;
 }
+
 
 static ngx_buf_t *
 ngx_http_client_create_request_buf(ngx_client_session_t *s)
@@ -1023,8 +1034,9 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
     ngx_http_request_t         *r;
     ngx_http_client_ctx_t      *ctx;
     ngx_buf_t                  *b;
-    ngx_keyval_t               *h;
     size_t                      len;
+    ngx_http_client_header_out_t *h;
+    ngx_uint_t                  i;
 
     r = s->data;
     ctx = r->ctx[0];
@@ -1037,15 +1049,13 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
     ++len; /* "/" */
     if (ctx->url.path.len) {
         /* "path" */
-        len += ctx->url.path.len + 2 * ngx_escape_uri(NULL, ctx->url.path.data,
-               ctx->url.path.len, NGX_ESCAPE_URI);
+        len += ctx->url.path.len;
     }
 
     if (ctx->url.args.len) {
         /* "?args" */
         ++len;
-        len += ctx->url.args.len + 2 * ngx_escape_uri(NULL, ctx->url.args.data,
-               ctx->url.args.len, NGX_ESCAPE_URI);
+        len += ctx->url.args.len;
     }
     ++len; /* " " */
 
@@ -1054,22 +1064,20 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
 
     /* Request Headers */
     /* User set headers */
-    h = ctx->headers;
-    while (h && h->key.len) {
+    h = ctx->headers_out.headers.elts;
+    for (i = 0; i < ctx->headers_out.headers.nelts; ++i, ++h) {
+        if (h->value.len == 0) {
+            continue;
+        }
+
         len += h->key.len + sizeof(": ") - 1 + h->value.len + sizeof(CRLF) - 1;
-
-        ngx_http_client_set_header_flag(r, &h->key);
-
-        ++h;
     }
-
-    len += ngx_http_client_default_header_len(r);
 
     /* Request Headers end */
     len += sizeof(CRLF) - 1;
 
     /* start fill http request */
-    b = ngx_create_temp_buf(r->connection->pool, len);
+    b = ngx_create_temp_buf(r->pool, len);
     if (b == NULL) {
         return NULL;
     }
@@ -1082,14 +1090,12 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
     /* path + args */
     *b->last++ = '/';
     if (ctx->url.path.len) {
-        b->last = (u_char *) ngx_escape_uri(b->last, ctx->url.path.data,
-                             ctx->url.path.len, NGX_ESCAPE_URI);
+        b->last = ngx_cpymem(b->last, ctx->url.path.data, ctx->url.path.len);
     }
 
     if (ctx->url.args.len) {
         *b->last++ = '?';
-        b->last = (u_char *) ngx_escape_uri(b->last, ctx->url.args.data,
-                             ctx->url.args.len, NGX_ESCAPE_URI);
+        b->last = ngx_cpymem(b->last, ctx->url.args.data, ctx->url.args.len);
     }
     *b->last++ = ' ';
 
@@ -1100,17 +1106,16 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
     *b->last++ = CR; *b->last++ = LF;
 
     /* Request Headers */
-    ngx_http_client_default_header_set(r, b);
+    h = ctx->headers_out.headers.elts;
+    for (i = 0; i < ctx->headers_out.headers.nelts; ++i, ++h) {
+        if (h->value.len == 0) {
+            continue;
+        }
 
-    /* User set headers */
-    h = ctx->headers;
-    while (h && h->key.len) {
         b->last = ngx_cpymem(b->last, h->key.data, h->key.len);
         *b->last++ = ':'; *b->last++ = ' ';
         b->last = ngx_cpymem(b->last, h->value.data, h->value.len);
         *b->last++ = CR; *b->last++ = LF;
-
-        ++h;
     }
 
     /* Request Headers end */
@@ -1118,6 +1123,7 @@ ngx_http_client_create_request_buf(ngx_client_session_t *s)
 
     return b;
 }
+
 
 static void
 ngx_http_client_send_header(ngx_client_session_t *s)
@@ -1137,9 +1143,7 @@ ngx_http_client_send_header(ngx_client_session_t *s)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
             "http client, send header");
 
-    if (ngx_http_client_reinit(s) == NGX_ERROR) {
-        goto destroy;
-    }
+    r->connection = s->peer.connection;
 
     b = ngx_http_client_create_request_buf(s);
     if (b == NULL) {
@@ -1154,11 +1158,11 @@ ngx_http_client_send_header(ngx_client_session_t *s)
     ngx_client_write(s, &out);
 
     /* user defined, for send body function callback */
-    if (ctx->write_handler) {
+    if (ctx->request && ctx->write_handler) {
         ctx->write_handler(ctx->request, r);
     }
 
-    ngx_add_timer(rev, ctx->server_header_timeout);
+    NGX_ADD_TIMER(rev, ctx->header_timeout, offsetof(ngx_connection_t, number));
 
     return;
 
@@ -1166,334 +1170,518 @@ destroy:
     ngx_http_client_finalize_request(r, 1);
 }
 
+
 static ngx_int_t
-ngx_http_client_body_read_filter(ngx_http_request_t *hcr, ngx_chain_t **in,
-        size_t size)
+ngx_http_client_body_length(ngx_http_request_t *r, ngx_chain_t *cl)
 {
-    ngx_client_session_t       *s;
     ngx_http_client_ctx_t      *ctx;
-    ngx_chain_t               **cl;
-    ngx_int_t                   n;
-    ngx_event_t                *rev;
+    ngx_buf_t                  *buf;
+    ngx_chain_t               **ll;
+    ngx_int_t                   len;
 
-    ctx = hcr->ctx[0];
-    s = ctx->session;
-    rev = hcr->connection->read;
+    ctx = r->ctx[0];
 
-    for (cl = in; *cl; cl = &(*cl)->next);
+    for (ll = &ctx->in; *ll; ll = &(*ll)->next);
 
-    if (ctx->length == 0) {
-        ctx->length = ctx->headers_in.content_length_n;
-    }
+    while (cl) {
+        *ll = cl;
+        cl = cl->next;
+        (*ll)->next = NULL;
 
-    while (1) {
-        *cl = ngx_get_chainbuf(size, 1);
-        if (hcr->connection->buffer->last != hcr->connection->buffer->pos) {
-            (*cl)->buf->pos = hcr->connection->buffer->pos;
-            (*cl)->buf->last = hcr->connection->buffer->last;
-            hcr->connection->buffer->pos = hcr->connection->buffer->last;
-            n = NGX_OK;
-        } else {
-            n = ngx_client_read(s, (*cl)->buf);
-
-            if (n == 0) {
-                ngx_log_error(NGX_LOG_ERR, hcr->connection->log, ngx_errno,
-                        "http client, server close");
-                return 0;
-            }
-        }
-
-        if (n == NGX_ERROR) {
-            ngx_log_error(NGX_LOG_ERR, hcr->connection->log, ngx_errno,
-                    "http client, body read filter read ERROR");
-            return NGX_ERROR;
-        }
-
-        if (n == NGX_AGAIN) {
-            ngx_put_chainbuf(*cl);
-            (*cl) = NULL;
-
-            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
-                ngx_http_client_finalize_request(hcr, 1);
-                return NGX_ERROR;
-            }
-
-            return NGX_AGAIN;
-        }
-
-        n = (*cl)->buf->last - (*cl)->buf->pos;
-
-        ctx->rbytes += n;
         if (ctx->length != -1) {
-            ctx->length -= n;
-            if (ctx->length <= 0) {
-                ngx_log_error(NGX_LOG_INFO, hcr->connection->log, 0,
-                    "http client, body read filter read %O bytes", ctx->rbytes);
+            buf = (*ll)->buf;
+
+            len = ngx_min(buf->last - buf->pos, ctx->length);
+            ctx->length -= len;
+
+            if (ctx->length == 0) {
+                if (cl || buf->last - buf->pos > len) {
+                    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                            "http client, read unexpected data");
+                    ngx_put_chainbufs(cl);
+                }
                 return NGX_DONE;
             }
         }
 
-        cl = &(*cl)->next;
+        ll = &(*ll)->next;
     }
+
+    return NGX_AGAIN;
 }
 
+
 static ngx_int_t
-ngx_http_client_body_chunked_filter(ngx_http_request_t *hcr, ngx_chain_t **in,
-        size_t size)
+ngx_http_client_body_chunked(ngx_http_request_t *r, ngx_chain_t *cl)
 {
     ngx_http_client_ctx_t      *ctx;
-    ngx_chain_t               **ll, *cl = NULL, *l;
+    ngx_http_client_conf_t     *hccf;
+    ngx_buf_t                  *buf, *b;
+    ngx_chain_t               **ll, *ln;
     ngx_int_t                   rc;
     size_t                      len;
 
-    ctx = hcr->ctx[0];
+    ctx = r->ctx[0];
+    hccf = (ngx_http_client_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
+                                                   ngx_http_client_module);
 
-    if (!ctx->headers_in.chunked) {
-        return ngx_http_client_body_read_filter(hcr, in, size);
-    }
+    for (ll = &ctx->in; *ll; ll = &(*ll)->next);
 
-    rc = ngx_http_client_body_read_filter(hcr, &cl, size);
+    while (1) {
 
-    if (rc == NGX_ERROR || rc == 0) {
-        return rc;
-    }
+        b = cl->buf;
+        rc = ngx_http_parse_chunked(r, b, &ctx->chunked);
 
-    /* NGX_AGAIN */
-
-    for (ll = in; *ll; ll = &(*ll)->next);
-
-    for (;;) {
-
-        rc = ngx_http_parse_chunked(hcr, cl->buf, &ctx->chunked);
-
-        ngx_log_debug7(NGX_LOG_DEBUG_CORE, hcr->connection->log, 0,
+        ngx_log_debug7(NGX_LOG_DEBUG_CORE, r->connection->log, 0,
                 "http client, parse chunked %p %p-%p %p, rc: %d, %O %O",
-                cl->buf->start, cl->buf->pos, cl->buf->last, cl->buf->end,
+                b->start, b->pos, b->last, b->end,
                 rc, ctx->chunked.size, ctx->chunked.length);
 
         if (rc == NGX_OK) {
 
             /* a chunk has been parsed successfully */
 
-            for (;;) {
+            while (1) {
                 if (*ll == NULL) {
-                    *ll = ngx_get_chainbuf(size, 1);
+                    *ll = ngx_get_chainbuf(hccf->body_buffer_size, 1);
+                    if (*ll == NULL) {
+                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                "http client, get chainbuf failed");
+                        return NGX_ERROR;
+                    }
                 }
 
-                len = ngx_min(ctx->chunked.size, cl->buf->last
-                                                - cl->buf->pos);
-                if ((*ll)->buf->end - (*ll)->buf->last >= (long) len) {
-                    (*ll)->buf->last = ngx_cpymem((*ll)->buf->last,
-                                                  cl->buf->pos, len);
-                    cl->buf->pos += len;
-                    ctx->chunked.size -= len;
+                buf = (*ll)->buf;
 
-                    goto done;
+                if (b->last - b->pos >= ctx->chunked.size) {
+                    len = ngx_min(buf->end - buf->last, ctx->chunked.size);
+                } else {
+                    len = ngx_min(buf->end - buf->last, b->last - b->pos);
                 }
 
-                len = (*ll)->buf->end - (*ll)->buf->last;
-                (*ll)->buf->last = ngx_cpymem((*ll)->buf->last,
-                                              cl->buf->pos, len);
-                cl->buf->pos += len;
+                buf->last = ngx_cpymem(buf->last, b->pos, len);
+                b->pos += len;
                 ctx->chunked.size -= len;
 
-                ll = &(*ll)->next;
-            }
+                if (buf->last == buf->end) {
+                    ll = &(*ll)->next;
+                }
 
-done:
-            ngx_log_debug7(NGX_LOG_DEBUG_CORE, hcr->connection->log, 0,
-                    "http client, parse done %p %p-%p %p, rc: %d, %O %O",
-                    cl->buf->start, cl->buf->pos, cl->buf->last, cl->buf->end,
-                    rc, ctx->chunked.size, ctx->chunked.length);
+                if (b->pos == b->last) { // current cl read over
+                    ln = cl;
+                    cl = cl->next;
+                    ngx_put_chainbuf(ln);
 
-            if (cl->buf->pos == cl->buf->last) {
-                l = cl;
-                cl = cl->next;
-                ngx_put_chainbuf(l);
+                    if (cl == NULL) {
+                        return NGX_AGAIN;
+                    }
 
-                if (cl == NULL) {
-                    return NGX_OK;
+                    b = cl->buf;
+                }
+
+                if (ctx->chunked.size == 0) { // current chunk read over
+                    break;
                 }
             }
+
+            ngx_log_debug7(NGX_LOG_DEBUG_CORE, r->connection->log, 0,
+                    "http client, parse done %p %p-%p %p, rc: %d, %O %O",
+                    b->start, b->pos, b->last, b->end,
+                    rc, ctx->chunked.size, ctx->chunked.length);
 
             continue;
         }
 
         if (rc == NGX_AGAIN) {
-            l = cl;
+            ln = cl;
             cl = cl->next;
-            ngx_put_chainbuf(l);
+            ngx_put_chainbuf(ln);
 
             if (cl == NULL) {
                 return NGX_AGAIN;
             }
+
             continue;
         }
 
         if (rc == NGX_DONE) {
-            /* a whole response has been parsed successfully */
+            if (b->pos != b->last || cl->next) {
+                ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                        "http client, read unexpected chunked data");
+            }
+            ngx_put_chainbufs(cl);
+
             return NGX_DONE;
         }
 
-        ngx_log_error(NGX_LOG_ERR, hcr->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                 "http client, invalid chunked response");
 
         return NGX_ERROR;
     }
 }
 
+
+/* create and set http request */
+
 ngx_http_request_t *
-ngx_http_client_create_request(ngx_str_t *request_url, ngx_uint_t method,
-        ngx_uint_t http_version, ngx_keyval_t *headers, ngx_log_t *log,
-        ngx_http_client_handler_pt read_handler,
-        ngx_http_client_handler_pt write_handler)
+ngx_http_client_create(ngx_log_t *log, ngx_uint_t method, ngx_str_t *url,
+    ngx_keyval_t *headers, ngx_http_client_handler_pt send_body, void *request)
 {
     ngx_pool_t                 *pool;
     ngx_http_request_t         *r;
     ngx_http_client_ctx_t      *ctx;
-    ngx_int_t                   rc;
+    ngx_http_client_conf_t     *hccf;
+    ngx_http_client_fill_header_t   *h;
+    ngx_str_t                   value;
 
-    if (request_url == NULL || request_url->len == 0) {
-        ngx_log_error(NGX_LOG_ERR, log, 0, "http client, request_url error");
+    hccf = (ngx_http_client_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
+                                                   ngx_http_client_module);
+
+    if (url == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "url is NULL when create http client");
         return NULL;
     }
 
-    pool = ngx_create_pool(4096, ngx_cycle->log);
+    pool = NGX_CREATE_POOL(4096, ngx_cycle->log);
     if (pool == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, create pool failed");
         return NULL;
     }
 
     r = ngx_pcalloc(pool, sizeof(ngx_http_request_t));
     if (r == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, create http request failed");
         goto destroy;
     }
-
     r->pool = pool;
+    r->main = r;
 
-    r->ctx = ngx_pcalloc(r->pool, sizeof(void *) * 1);
+    /* create http client ctx */
+    r->ctx = ngx_pcalloc(pool, sizeof(void *) * 1);
     if (r->ctx == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, create http request ctxs failed");
         goto destroy;
     }
 
-    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_client_ctx_t));
+    ctx = ngx_pcalloc(pool, sizeof(ngx_http_client_ctx_t));
     if (ctx == NULL) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, create http request ctx failed");
         goto destroy;
     }
     r->ctx[0] = ctx;
-    r->main = r;
 
-    r->method = method > NGX_HTTP_CLIENT_TRACE ? NGX_HTTP_CLIENT_GET : method;
+    /* set paras for http client */
+    r->method = method;
 
-    r->http_version = http_version > NGX_HTTP_CLIENT_VERSION_20 ?
-                      NGX_HTTP_CLIENT_VERSION_11 : http_version;
+    /* default version HTTP/1.1 */
+    r->http_version = NGX_HTTP_CLIENT_VERSION_11;
 
-    r->request_line.data = ngx_pcalloc(r->pool, request_url->len);
-    if (r->request_line.data == NULL) {
+    /* for send body */
+    ctx->request = request;
+    ctx->write_handler = send_body;
+
+    ctx->header_timeout = hccf->header_timeout;
+    ctx->header_buffer_size = hccf->header_buffer_size;
+
+    if (ngx_http_client_set_url(r, url, log) == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, set url failed");
         goto destroy;
     }
-    ngx_memcpy(r->request_line.data, request_url->data, request_url->len);
-    r->request_line.len = request_url->len;
 
-    /* set default config */
-    ctx->server_header_timeout = 10000;
-    ctx->server_header_buffer_size = 2048;
-
-    ctx->headers = headers;
-    ctx->read_handler = read_handler;
-    ctx->write_handler = write_handler;
-
-    rc = ngx_parse_request_url(&ctx->url, &r->request_line);
-    if (rc == NGX_ERROR) {
+    /* headers_out */
+    if (ngx_array_init(&ctx->headers_out.headers, pool, 64,
+            sizeof(ngx_http_client_header_out_t)) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                "client create, init headers out failed");
         goto destroy;
+    }
+
+    ngx_map_init(&ctx->headers_out.hash, ngx_map_hash_str, ngx_cmp_str);
+
+    h = ngx_http_client_default_header;
+    while(h->name.len) {
+        h->handler(r, &value);
+        if (ngx_http_client_add_header(r, &h->name, &value) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                    "client create, set default header %V: %V failed",
+                    &h->name, &value);
+            goto destroy;
+        }
+        ++h;
+    }
+
+    while (headers && headers->key.len) {
+        if (ngx_http_client_add_header(r, &headers->key, &headers->value)
+                != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                    "client create, set user header %V: %V failed",
+                    &h->name, &value);
+            goto destroy;
+        }
+        ++headers;
     }
 
     return r;
 
 destroy:
-    if (pool) {
-        ngx_destroy_pool(r->pool);
-    }
+    NGX_DESTROY_POOL(pool);
 
     return NULL;
 }
 
-ngx_int_t
-ngx_http_client_send(ngx_http_request_t *hcr, ngx_client_session_t *s,
-        void *request, ngx_log_t *log)
-{
-    ngx_client_init_t          *ci;
-    ngx_http_client_ctx_t      *ctx;
 
-    if (hcr == NULL) {
-        ngx_log_error(NGX_LOG_ERR, log, 0, "http client, request is NULL");
-        return NGX_ERROR;
+ngx_http_cleanup_t *
+ngx_http_client_cleanup_add(ngx_http_request_t *r, size_t size)
+{
+    ngx_http_cleanup_t  *cln;
+
+    r = r->main;
+
+    cln = ngx_palloc(r->pool, sizeof(ngx_http_cleanup_t));
+    if (cln == NULL) {
+        return NULL;
     }
 
-    ctx = hcr->ctx[0];
+    if (size) {
+        cln->data = ngx_palloc(r->pool, size);
+        if (cln->data == NULL) {
+            return NULL;
+        }
 
-    if (s == NULL) {
-        ci = ngx_client_init(&ctx->url.host, NULL, 0, log);
-        ci->port = ngx_request_port(&ctx->url.scheme, &ctx->url.port);
+    } else {
+        cln->data = NULL;
+    }
 
-        ci->connected = ngx_http_client_send_header;
-        ci->closed = ngx_http_client_close_handler;
+    cln->handler = NULL;
+    cln->next = r->cleanup;
 
-        s = ngx_client_connect(ci, log);
-        if (s == NULL) {
+    r->cleanup = cln;
+
+    return cln;
+}
+
+
+void
+ngx_http_client_set_read_handler(ngx_http_request_t *r,
+    ngx_http_client_handler_pt read_handler)
+{
+    ngx_http_client_ctx_t      *ctx;
+
+    ctx = r->ctx[0];
+
+    ctx->read_handler = read_handler;
+}
+
+
+ngx_int_t
+ngx_http_client_set_headers(ngx_http_request_t *r, ngx_keyval_t *headers)
+{
+    while (headers && headers->key.len) {
+        if (ngx_http_client_add_header(r, &headers->key, &headers->value)
+                != NGX_OK)
+        {
             return NGX_ERROR;
         }
-
-        s->data = hcr;
-        ctx->session = s;
-        ctx->request = request;
-    } else {
-        ci = s->ci;
-
-        ci->connected = ngx_http_client_send_header;
-        ci->closed = ngx_http_client_close_handler;
-
-        s->data = hcr;
-        ctx->session = s;
-        ctx->request = request;
-        hcr->connection = s->connection;
-
-        if (s->connected) {
-            ngx_http_client_send_header(s);
-        }
+        ++headers;
     }
 
     return NGX_OK;
 }
 
-ngx_uint_t
-ngx_http_client_http_version(ngx_http_request_t *hcr)
+
+void
+ngx_http_client_set_write_handler(ngx_http_request_t *r,
+    ngx_http_client_handler_pt write_handler)
 {
     ngx_http_client_ctx_t      *ctx;
 
-    ctx = hcr->ctx[0];
+    ctx = r->ctx[0];
+
+    ctx->write_handler = write_handler;
+}
+
+
+void
+ngx_http_client_set_version(ngx_http_request_t *r, ngx_uint_t version)
+{
+    r->http_version = version;
+}
+
+
+void
+ngx_http_client_setopt(ngx_http_request_t *r, unsigned opt, ngx_uint_t value)
+{
+    ngx_http_client_ctx_t      *ctx;
+    ngx_client_session_t       *s;
+
+    ctx = r->ctx[0];
+    s = ctx->session;
+
+    switch (opt) {
+    case NGX_HTTP_CLIENT_OPT_CONNECT_TIMEOUT:
+        s->connect_timeout = value;
+        break;
+    case NGX_HTTP_CLIENT_OPT_SEND_TIMEOUT:
+        s->send_timeout = value;
+        break;
+    case NGX_HTTP_CLIENT_OPT_POSTPONE_OUTPUT:
+        s->postpone_output = value;
+        break;
+    case NGX_HTTP_CLIENT_OPT_DYNAMIC_RESOLVER:
+        s->dynamic_resolver = value > 0;
+        break;
+    case NGX_HTTP_CLIENT_OPT_TCP_NODELAY:
+        s->tcp_nodelay = value > 0;
+        break;
+    case NGX_HTTP_CLIENT_OPT_TCP_NOPUSH:
+        s->tcp_nopush = value > 0;
+        break;
+    case NGX_HTTP_CLIENT_OPT_HEADER_TIMEOUT:
+        ctx->header_timeout = value;
+        break;
+    default:
+        ngx_log_error(NGX_LOG_ERR, &s->log, 0,
+                "try to set unsupported opt %d", opt);
+        break;
+    }
+}
+
+/* send http request */
+
+ngx_int_t
+ngx_http_client_send(ngx_http_request_t *r)
+{
+    ngx_client_session_t       *s;
+    ngx_http_client_ctx_t      *ctx;
+
+    ctx = r->ctx[0];
+    s = ctx->session;
+
+    /* init */
+    s->client_connected = ngx_http_client_send_header;
+    s->client_recv = ngx_http_client_wait_response_handler;
+    s->client_closed = ngx_http_client_close_handler;
+
+    /*
+     * init ctx->headers_in, headers_in use c->pool,
+     * reconnect will destroy and reinit ctx->headsers_in
+     */
+    if (ngx_list_init(&ctx->headers_in.headers, r->pool, 20,
+                      sizeof(ngx_table_elt_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    ctx->headers_in.content_length_n = -1;
+
+    ngx_client_connect(s);
+
+    return NGX_OK;
+}
+
+
+ngx_http_request_t *
+ngx_http_client_get(ngx_log_t *log, ngx_str_t *url, ngx_keyval_t *headers,
+    void *request)
+{
+    ngx_http_request_t         *r;
+
+    r = ngx_http_client_create(log, NGX_HTTP_CLIENT_GET, url, headers,
+            NULL, request);
+    if (r == NULL) {
+        return NULL;
+    }
+
+    if (ngx_http_client_send(r) == NGX_ERROR) {
+        return NULL;
+    }
+
+    return r;
+}
+
+
+ngx_http_request_t *
+ngx_http_client_head(ngx_log_t *log, ngx_str_t *url, ngx_keyval_t *headers,
+    void *request)
+{
+    ngx_http_request_t         *r;
+
+    r = ngx_http_client_create(log, NGX_HTTP_CLIENT_HEAD, url, headers,
+            NULL, request);
+    if (r == NULL) {
+        return NULL;
+    }
+
+    if (ngx_http_client_send(r) == NGX_ERROR) {
+        return NULL;
+    }
+
+    return r;
+}
+
+
+ngx_http_request_t *
+ngx_http_client_post(ngx_log_t *log, ngx_str_t *url, ngx_keyval_t *headers,
+    ngx_http_client_handler_pt send_body, void *request)
+{
+    ngx_http_request_t         *r;
+
+    r = ngx_http_client_create(log, NGX_HTTP_CLIENT_POST, url, headers,
+            send_body, request);
+    if (r == NULL) {
+        return NULL;
+    }
+
+    if (ngx_http_client_send(r) == NGX_ERROR) {
+        return NULL;
+    }
+
+    return r;
+}
+
+
+/* get response */
+
+ngx_uint_t
+ngx_http_client_http_version(ngx_http_request_t *r)
+{
+    ngx_http_client_ctx_t      *ctx;
+
+    ctx = r->ctx[0];
 
     return ctx->headers_in.http_version;
 }
 
+
 ngx_uint_t
-ngx_http_client_status_code(ngx_http_request_t *hcr)
+ngx_http_client_status_code(ngx_http_request_t *r)
 {
     ngx_http_client_ctx_t      *ctx;
 
-    ctx = hcr->ctx[0];
+    ctx = r->ctx[0];
 
     return ctx->headers_in.status_n;
 }
 
+
 ngx_str_t *
-ngx_http_client_header_in(ngx_http_request_t *hcr, ngx_str_t *key)
+ngx_http_client_header_in(ngx_http_request_t *r, ngx_str_t *key)
 {
     ngx_http_client_ctx_t      *ctx;
     ngx_table_elt_t            *h;
     ngx_list_part_t            *part;
     ngx_uint_t                  i;
 
-    ctx = hcr->ctx[0];
+    ctx = r->ctx[0];
 
     part = &ctx->headers_in.headers.part;
     h = part->elts;
@@ -1524,37 +1712,178 @@ ngx_http_client_header_in(ngx_http_request_t *hcr, ngx_str_t *key)
     return NULL;
 }
 
+
 ngx_int_t
-ngx_http_client_write_body(ngx_http_request_t *hcr, ngx_chain_t *out)
+ngx_http_client_read_body(ngx_http_request_t *r, ngx_chain_t **in)
+{
+    ngx_client_session_t       *s;
+    ngx_http_client_ctx_t      *ctx;
+    ngx_http_client_conf_t     *hccf;
+    ngx_buf_t                  *buf;
+    ngx_int_t                   n, rc;
+    ngx_event_t                *rev;
+    ngx_chain_t                *cl, **ll, *ln;
+
+    ctx = r->ctx[0];
+    s = ctx->session;
+    rev = r->connection->read;
+    hccf = (ngx_http_client_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
+                                                   ngx_http_client_module);
+
+    // recycle bufs
+    while (ctx->in) {
+        cl = ctx->in;
+        ctx->in = cl->next;
+        if (cl->buf->pos != cl->buf->last) {
+            break;
+        }
+
+        ngx_put_chainbuf(cl);
+    }
+
+    cl = NULL;
+    ll = &cl;
+
+    // part of body will read with header
+    if (ctx->buffer->last != ctx->buffer->pos) {
+        ln = ngx_get_chainbuf(hccf->body_buffer_size, 0);
+        if (ln == NULL) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                    "http client, alloc chainbuf without buffer failed");
+            return NGX_ERROR;
+        }
+        buf = ln->buf;
+        buf->pos = ctx->buffer->pos;
+        buf->last = ctx->buffer->last;
+        ctx->buffer->pos = ctx->buffer->last;
+
+        *ll = ln;
+        ll = &(*ll)->next;
+    }
+
+    // start read
+    while (1) {
+        ln = ngx_get_chainbuf(hccf->body_buffer_size, 1);
+        if (ln == NULL) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                    "http client, alloc chainbuf with buffer failed");
+            return NGX_ERROR;
+        }
+        buf = ln->buf;
+
+        n = ngx_client_read(s, buf);
+
+        if (n == 0) {
+            ngx_put_chainbuf(ln);
+            ngx_put_chainbufs(cl);
+
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                    "http client, server close");
+            return 0;
+        }
+
+        if (n == NGX_ERROR) {
+            ngx_put_chainbuf(ln);
+            ngx_put_chainbufs(cl);
+
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                    "http client, server error close");
+            return NGX_ERROR;
+        }
+
+        if (n == NGX_AGAIN) { // all data in socket has been read
+            ngx_put_chainbuf(ln);
+
+            if (ngx_handle_read_event(rev, 0) != NGX_OK) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                        "http client, handle read event error");
+                return NGX_ERROR;
+            }
+
+            break;
+        }
+
+        *ll = ln;
+        ll = &(*ll)->next;
+        ctx->rbytes += n;
+    }
+
+    if (ctx->headers_in.chunked) {
+        rc = ngx_http_client_body_chunked(r, cl);
+    } else {
+        rc = ngx_http_client_body_length(r, cl);
+    }
+
+    if (rc == NGX_ERROR) { // parse chunked error
+        return NGX_ERROR;
+    }
+
+    *in = ctx->in;
+    if (rc == NGX_DONE) { // all body has been read
+        return NGX_DONE;
+    }
+
+    return NGX_AGAIN;
+}
+
+
+off_t
+ngx_http_client_rbytes(ngx_http_request_t *r)
 {
     ngx_http_client_ctx_t      *ctx;
-    ngx_client_session_t       *s;
 
-    ctx = hcr->ctx[0];
-    s = ctx->session;
+    ctx = r->ctx[0];
 
-    return ngx_client_write(s, out);
+    return ctx->rbytes;
 }
 
-ngx_int_t
-ngx_http_client_read_body(ngx_http_request_t *hcr, ngx_chain_t **in,
-        size_t size)
+
+off_t
+ngx_http_client_wbytes(ngx_http_request_t *r)
 {
-    return ngx_http_client_body_chunked_filter(hcr, in, size);
+    ngx_http_client_ctx_t      *ctx;
+
+    ctx = r->ctx[0];
+
+    return ctx->wbytes;
 }
+
+
+/* end request */
 
 void
-ngx_http_client_finalize_request(ngx_http_request_t *hcr, ngx_flag_t closed)
+ngx_http_client_detach(ngx_http_request_t *r)
+{
+    ngx_http_client_ctx_t      *ctx;
+
+    if (r == NULL) {
+        return;
+    }
+
+    ctx = r->ctx[0];
+
+    ctx->request = NULL;
+
+    if (r->connection) {
+        ngx_post_event(r->connection->read, &ngx_posted_events);
+    }
+}
+
+
+void
+ngx_http_client_finalize_request(ngx_http_request_t *r, ngx_flag_t closed)
 {
     ngx_http_client_ctx_t      *ctx;
     ngx_client_session_t       *s;
 
-    ctx = hcr->ctx[0];
+    ctx = r->ctx[0];
     s = ctx->session;
 
-    ngx_http_client_free_request(hcr);
+    ngx_http_client_free_request(r);
 
     if (closed) {
         ngx_client_close(s);
+    } else {
+        ngx_client_set_keepalive(s);
     }
 }
