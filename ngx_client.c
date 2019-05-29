@@ -1339,6 +1339,8 @@ ngx_client_state(ngx_http_request_t *r, unsigned detail)
         + sizeof("ngx_client_pool nfree node: \n") - 1 + NGX_OFF_T_LEN
         + sizeof("ngx_client_pool idle connection: \n") - 1 + NGX_OFF_T_LEN;
 
+    len1 = 0;
+
     /* node for create pool */
     if (detail) {
         n = ccf->nalloc - ccf->nfree;
